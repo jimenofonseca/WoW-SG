@@ -1,158 +1,160 @@
-#!/usr/bin/env python
-
-from threading import Thread
-import serial
-import time
-import collections
+import serial as sr
+import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-import struct
-import copy
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import tkinter as Tk
-from tkinter.ttk import Frame
+import bluetooth
+import subprocess
+import json
+import dash
+import dash_core_components as dcc
+import dash_html_components as html
+import dash_daq as daq
+import time
+from collections import deque
+import plotly.graph_objs as go
+import datetime
 import pandas as pd
+import random
+import os
 
 
-class serialPlot:
-    def __init__(self, serialPort='/dev/ttyUSB0', serialBaud=38400, plotLength=100, dataNumBytes=2, numPlots=1):
-        self.port = serialPort
-        self.baud = serialBaud
-        self.plotMaxLength = plotLength
-        self.dataNumBytes = dataNumBytes
-        self.numPlots = numPlots
-        self.rawData = bytearray(numPlots * dataNumBytes)
-        self.dataType = None
-        if dataNumBytes == 2:
-            self.dataType = 'h'     # 2 byte integer
-        elif dataNumBytes == 4:
-            self.dataType = 'f'     # 4 byte float
-        self.data = []
-        for i in range(numPlots):   # give an array for each type of data and store them in a list
-            self.data.append(collections.deque([0] * plotLength, maxlen=plotLength))
-        self.isRun = True
-        self.isReceiving = False
-        self.thread = None
-        self.plotTimer = 0
-        self.previousTimer = 0
-        # self.csvData = []
+app = dash.Dash('vehicle-data')
+max_length = 50
+times = deque(maxlen=max_length)
+temperatures = deque(maxlen=max_length)
+humidities = deque(maxlen=max_length)
+illuminances = deque(maxlen=max_length)
 
-        print('Trying to connect to: ' + str(serialPort) + ' at ' + str(serialBaud) + ' BAUD.')
-        try:
-            self.serialConnection = serial.Serial(serialPort, serialBaud, timeout=4)
-            print('Connected to ' + str(serialPort) + ' at ' + str(serialBaud) + ' BAUD.')
-        except:
-            print("Failed to connect with " + str(serialPort) + ' at ' + str(serialBaud) + ' BAUD.')
+data_dict = {
+    "Temperature [C]": temperatures,
+    "Relative Humidity [%]": humidities,
+    "Illuminance [Lux]": illuminances,
+}
 
-    def readSerialStart(self):
-        if self.thread == None:
-            self.thread = Thread(target=self.backgroundThread)
-            self.thread.start()
-            # Block till we start receiving values
-            while self.isReceiving != True:
-                time.sleep(0.1)
-
-    def getSerialData(self, frame, lines, lineValueText, lineLabel, timeText):
-        currentTimer = time.clock()
-        self.plotTimer = int((currentTimer - self.previousTimer) * 1000)     # the first reading will be erroneous
-        self.previousTimer = currentTimer
-        timeText.set_text('Plot Interval = ' + str(self.plotTimer) + 'ms')
-        privateData = copy.deepcopy(self.rawData[:])    # so that the 3 values in our plots will be synchronized to the same sample time
-        for i in range(self.numPlots):
-            data = privateData[(i*self.dataNumBytes):(self.dataNumBytes + i*self.dataNumBytes)]
-            value,  = struct.unpack(self.dataType, data)
-            self.data[i].append(value)    # we get the latest data point and append it to our array
-            lines[i].set_data(range(self.plotMaxLength), self.data[i])
-            lineValueText[i].set_text('[' + lineLabel[i] + '] = ' + str(value))
-        # self.csvData.append([self.data[0][-1], self.data[1][-1], self.data[2][-1]])
-
-    def backgroundThread(self):    # retrieve data
-        time.sleep(1.0)  # give some buffer time for retrieving data
-        self.serialConnection.reset_input_buffer()
-        while (self.isRun):
-            self.serialConnection.readinto(self.rawData)
-            self.isReceiving = True
-            #print(self.rawData)
-
-    def sendSerialData(self, data):
-        self.serialConnection.write(data.encode('utf-8'))
-
-    def close(self):
-        self.isRun = False
-        self.thread.join()
-        self.serialConnection.close()
-        print('Disconnected...')
-        # df = pd.DataFrame(self.csvData)
-        # df.to_csv('/home/rikisenia/Desktop/data.csv')
+PORT = '/dev/cu.BT_SENSOR-SPPDev'
+ADDRESS = "98-d3-31-f9-52-0a"
+BITRATE = 9600
+stream = os.popen('blueutil --pair n')
+s = sr.Serial(PORT, BITRATE, timeout=0.1)
 
 
-class Window(Frame):
-    def __init__(self, figure, master, SerialReference):
-        Frame.__init__(self, master)
-        self.entry = None
-        self.setPoint = None
-        self.master = master        # a reference to the master window
-        self.serialReference = SerialReference      # keep a reference to our serial connection so that we can use it for bi-directional communicate from this class
-        self.initWindow(figure)     # initialize the window with our settings
+def read_values_from_arduino(times, temperatures, humidities, illuminances):
+    # set time
+    times.append(time.time())
+    # extract values
+    try:
+        reading_str = s.readline().decode()
+        reading_dict = json.loads(reading_str)
+        temperatures.append(reading_dict["T_C"])
+        humidities.append(reading_dict["RH_%"])
+        illuminances.append(reading_dict["I_lux"])
+    except:
+        temperatures.append(np.nan)
+        humidities.append(np.nan)
+        illuminances.append(np.nan)
 
-    def initWindow(self, figure):
-        self.master.title("Real Time Plot")
-        canvas = FigureCanvasTkAgg(figure, master=self.master)
-        canvas.get_tk_widget().pack(side=Tk.TOP, fill=Tk.BOTH, expand=1)
+    print(temperatures[-1])
+    return times, temperatures, humidities, illuminances
 
-        # create out widgets in the master frame
-        lbl1 = Tk.Label(self.master, text="Scaling Factor")
-        lbl1.pack(padx=5, pady=5)
-        self.entry = Tk.Entry(self.master)
-        self.entry.insert(0, '1.0')     # (index, string)
-        self.entry.pack(padx=5)
-        SendButton = Tk.Button(self.master, text='Send', command=self.sendFactorToMCU)
-        SendButton.pack(padx=5)
+#
+times, \
+temperatures, \
+humidities, \
+illuminances, = read_values_from_arduino(times, temperatures, humidities, illuminances)
 
-    def sendFactorToMCU(self):
-        self.serialReference.sendSerialData(self.entry.get() + '%')     # '%' is our ending marker
+app.layout = html.Div([
+    html.Div([html.H2('Vehicle Data', style={'float': 'left', }), ]),
+    html.Div([
+        daq.Joystick(
+            id='my-joystick',
+            label="Default",
+            angle=0,
+            force=0,
+        ),
+        html.Div(id='joystick-output')
+    ]),
+    dcc.Dropdown(id='data-name',
+                 options=[{'label': s, 'value': s}
+                          for s in data_dict.keys()],
+                 value=['Temperature [C]', 'Relative Humidity [%]', 'Illuminance [Lux]'],
+                 multi=True
+                 ),
+    html.Div(children=html.Div(id='graphs'), className='row'),
+    dcc.Interval(
+        id='graph-update',
+        interval=2000,
+        n_intervals=0)],
+    className="container", style={'width': '98%', 'margin-left': 10, 'margin-right': 10, 'max-width': 50000})
 
-def main():
-    # portName = 'COM5'
-    portName = '/dev/cu.usbserial-1410'
-    baudRate = 9600
-    maxPlotLength = 100     # number of points in x-axis of real time plot
-    dataNumBytes = 4        # number of bytes of 1 data point
-    numPlots = 3            # number of plots in 1 graph
-    s = serialPlot(portName, baudRate, maxPlotLength, dataNumBytes, numPlots)   # initializes all required variables
-    s.readSerialStart()                                               # starts background thread
 
-    # plotting starts below
-    pltInterval = 50    # Period at which the plot animation updates [ms]
-    xmin = 0
-    xmax = maxPlotLength
-    ymin = -(1)
-    ymax = 1
-    fig = plt.figure(figsize=(10, 8))
-    ax = plt.axes(xlim=(xmin, xmax), ylim=(float(ymin - (ymax - ymin) / 10), float(ymax + (ymax - ymin) / 10)))
-    ax.set_title('Arduino Accelerometer')
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Accelerometer Output")
+@app.callback(
+    dash.dependencies.Output('graphs', 'children'),
+    [dash.dependencies.Input('data-name', 'value'),
+     dash.dependencies.Input('graph-update', 'n_intervals')]
+)
+def update_graph(data_names, n):
+    graphs = []
+    read_values_from_arduino(times, temperatures, humidities, illuminances)
 
-    # put our plot onto Tkinter's GUI
-    root = Tk.Tk()
-    app = Window(fig, root, s)
+    if len(data_names) > 2:
+        class_choice = 'col s12 m6 l4'
+    elif len(data_names) == 2:
+        class_choice = 'col s12 m6 l6'
+    else:
+        class_choice = 'col s12'
 
-    lineLabel = ['X', 'Y', 'Z']
-    style = ['r-', 'c-', 'b-']  # linestyles for the different plots
-    timeText = ax.text(0.70, 0.95, '', transform=ax.transAxes)
-    lines = []
-    lineValueText = []
-    for i in range(numPlots):
-        lines.append(ax.plot([], [], style[i], label=lineLabel[i])[0])
-        lineValueText.append(ax.text(0.70, 0.90-i*0.05, '', transform=ax.transAxes))
-    anim = animation.FuncAnimation(fig, s.getSerialData, fargs=(lines, lineValueText, lineLabel, timeText), interval=pltInterval)    # fargs has to be a tuple
+    data = []
+    for data_name in data_names:
+        data.append(go.Scatter(
+            x=list(times),
+            y=list(data_dict[data_name]),
+            name=data_name,
+            # fill="tozeroy",
+            # fillcolor="#6897bb"
+        ))
 
-    plt.legend(loc="upper left")
-    root.mainloop()   # use this instead of plt.show() since we are encapsulating everything in Tkinter
+    graphs.append(
+        html.Div(dcc.Graph(id='data',
+                           animate=True,
+                           figure={'data': data,
+                                   'layout': go.Layout(xaxis=dict(range=[min(times), max(times)],
+                                                                  tickmode='linear'),
+                                                       yaxis=dict(autorange=True),
+                                                       margin={'l': 50, 'r': 1, 't': 45, 'b': 1})}
+                           ), className=class_choice))
 
-    s.close()
+    return graphs
 
+@app.callback(
+    dash.dependencies.Output('joystick-output', 'children'),
+    [dash.dependencies.Input('my-joystick', 'angle'),
+     dash.dependencies.Input('my-joystick', 'force')])
+def update_output(angle, force):
+
+    #send orders to controller
+    #turn right
+    if force > 0.01:
+        # move rigth
+        if (315 <= angle <= 360) or (0 <= angle <= 45):
+            messagge =b"r"
+        elif (0 <= angle <= 45):
+            messagge =b"r"
+        #move forward
+        elif (45 < angle < 135):
+            messagge =b"f"
+        #move left
+        elif (135 <= angle < 225):
+            messagge =b"l"
+        #move backwards
+        elif (225 <= angle < 315):
+            messagge = b"b"
+    else:
+        messagge = b"s"
+
+    s.write(messagge)
+    time.sleep(0.05)
+    return ['Angle is {}'.format(angle),
+            html.Br(),
+            'Force is {}'.format(force)]
 
 if __name__ == '__main__':
-    main()
+    app.run_server(debug=True, host='0.0.0.0')
